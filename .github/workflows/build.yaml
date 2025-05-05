@@ -1,0 +1,102 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.24'
+
+      - name: Build binary
+        run: go build -v -o argon-proxy .
+
+      - name: Get latest release
+        id: latest_release
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            
+            if (releases.length === 0) {
+              return core.setFailed('No releases found');
+            }
+            
+            const latestRelease = releases[0];
+            core.setOutput('release_id', latestRelease.id);
+            core.setOutput('release_tag', latestRelease.tag_name);
+
+      - name: Check if binary asset exists
+        id: check_asset
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const releaseId = ${{ steps.latest_release.outputs.release_id }};
+            
+            const { data: assets } = await github.rest.repos.listReleaseAssets({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId
+            });
+            
+            const existingAsset = assets.find(asset => asset.name === 'argon-proxy');
+            
+            if (existingAsset) {
+              core.setOutput('asset_id', existingAsset.id);
+              core.setOutput('asset_exists', 'true');
+            } else {
+              core.setOutput('asset_exists', 'false');
+            }
+
+      - name: Delete existing binary asset if exists
+        if: steps.check_asset.outputs.asset_exists == 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const assetId = ${{ steps.check_asset.outputs.asset_id }};
+            
+            await github.rest.repos.deleteReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              asset_id: assetId
+            });
+
+      - name: Upload binary to release
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const releaseId = ${{ steps.latest_release.outputs.release_id }};
+            
+            // Read binary file
+            const binaryData = fs.readFileSync('./argon-proxy');
+            
+            // Upload binary to release
+            await github.rest.repos.uploadReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+              name: 'argon-proxy',
+              data: binaryData
+            });
