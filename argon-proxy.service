@@ -1,0 +1,18 @@
+[Unit]
+Description=Argon Proxy Server
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+ExecStart=/usr/local/bin/argon-proxy --address=127.0.0.1 --port=8080 --allow-origin=* --verbose
+Restart=on-failure
+RestartSec=5
+# Hardening options
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

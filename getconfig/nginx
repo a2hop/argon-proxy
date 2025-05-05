@@ -1,0 +1,61 @@
+# CORS Proxy configuration
+# Include this file in your server block where you want to add CORS proxy functionality
+
+# CORS proxy location - accessible via /cors-proxy?target=https://example.com/api
+location /cors-proxy {
+    # Ensure target parameter exists
+    if ($arg_target = '') {
+        return 400 "Missing 'target' parameter";
+    }
+
+    # Get the Origin header from the request
+    set $cors_origin $http_origin;
+    
+    # If Origin header is empty, use a default or deny
+    if ($cors_origin = '') {
+        set $cors_origin 'null';
+    }
+
+    # CORS headers - always add these headers with dynamic origin
+    add_header 'Access-Control-Allow-Origin' $cors_origin always;
+    add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, PUT, DELETE, PATCH' always;
+    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
+    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
+    add_header 'Access-Control-Allow-Credentials' 'true' always;
+
+    # Handle OPTIONS method for preflight requests
+    if ($request_method = 'OPTIONS') {
+        add_header 'Access-Control-Allow-Origin' $cors_origin always;
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, PUT, DELETE, PATCH' always;
+        add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
+        add_header 'Access-Control-Allow-Credentials' 'true' always;
+        add_header 'Access-Control-Max-Age' 1728000 always;
+        add_header 'Content-Type' 'text/plain charset=UTF-8' always;
+        add_header 'Content-Length' 0 always;
+        return 204;
+    }
+
+    # Forward the request to your Go CORS proxy server
+    # Keep all original query parameters intact
+    proxy_pass http://localhost:8080/proxy$is_args$args;
+    
+    # Pass the original request headers to the Go server
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    
+    # Pass the original request method and body
+    proxy_method $request_method;
+    proxy_pass_request_body on;
+    proxy_pass_request_headers on;
+
+    # Handle large responses
+    proxy_buffers 8 16k;
+    proxy_buffer_size 32k;
+
+    # Increase timeouts for slow APIs
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+}
