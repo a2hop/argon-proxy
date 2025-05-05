@@ -1,3 +1,4 @@
+// Argon-Proxy: A CORS proxy server that handles URL query parameters properly
 package main
 
 import (
@@ -13,8 +14,9 @@ import (
 	"strings"
 )
 
+// Command line flags
 var (
-	port          = flag.Int("port", 8080, "Port to listen on ")
+	port          = flag.Int("port", 8080, "Port to listen on")
 	address       = flag.String("address", "127.0.0.1", "Address to listen on")
 	allowedOrigin = flag.String("allow-origin", "*", "CORS Allow-Origin header value")
 	verbose       = flag.Bool("verbose", false, "Enable verbose logging")
@@ -24,6 +26,7 @@ var (
 //go:embed getconfig/*
 var SampleConfigs embed.FS
 
+// main is the entry point for the CORS proxy server
 func main() {
 	flag.Parse()
 
@@ -40,58 +43,17 @@ func main() {
 	printStartupInfo(listenAddr)
 
 	// Start the server
+	log.Printf("Server starting on %s", listenAddr)
 	if err := http.ListenAndServe(listenAddr, nil); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
 
-// Print startup information
-func printStartupInfo(listenAddr string) {
-	log.Printf("Starting CORS proxy server on %s", listenAddr)
-	log.Printf("CORS proxy supports:")
-	log.Printf("  - http://%s/proxy/{target-url}", listenAddr)
-	log.Printf("  - http://%s/proxy/?target={target-url}", listenAddr)
-	log.Printf("  - http://%s/getconfig/{filename}", listenAddr)
-	log.Printf("CORS Allow-Origin: %s", *allowedOrigin)
-	log.Printf("Trust X-Forwarded-* headers: %v", *trustProxy)
-}
+// -----------------------------
+// PROXY REQUEST HANDLING
+// -----------------------------
 
-// displayUsage outputs API usage instructions to the response writer
-func displayUsage(w http.ResponseWriter, r *http.Request, section string) {
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(http.StatusOK)
-
-	log.Printf("Original request: %s", r.URL.RawQuery)
-
-	fmt.Fprintf(w, "CORS Proxy Usage:\n")
-
-	// Show general usage info
-	fmt.Fprintf(w, "GET /proxy/{url} - Proxy to the specified URL\n")
-	fmt.Fprintf(w, "GET /getconfig/{filename} - Get embedded configuration file\n")
-
-	// Show section-specific examples
-	if section == "proxy" || section == "all" {
-		fmt.Fprintf(w, "\nProxy Examples:\n")
-		fmt.Fprintf(w, "  - GET /proxy/https://api.example.com/data\n")
-		fmt.Fprintf(w, "  - GET /proxy/?target=https://api.example.com/data\n")
-	}
-
-	if section == "config" || section == "all" {
-		fmt.Fprintf(w, "\nConfig Examples:\n")
-		fmt.Fprintf(w, "  - GET /getconfig/nginx\n")
-	}
-}
-
-// Root handler to provide usage information
-func handleRoot(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-
-	displayUsage(w, r, "all")
-}
-
+// handleProxy processes proxy requests to external services
 func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Handle OPTIONS requests for CORS preflight
 	if r.Method == "OPTIONS" {
@@ -111,31 +73,37 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	processProxyRequest(w, r, targetURL)
 }
 
-// Parse target URL from request (manual parsing, no stdlib URL parsing)
+// parseTargetURL extracts the target URL from the request
+// Uses manual parsing to handle nested query parameters
 func parseTargetURL(r *http.Request) string {
+	// First try to get the target from query parameters
 	rawQuery := r.URL.RawQuery
 	targetPrefix := "target="
 	targetStart := strings.Index(rawQuery, targetPrefix)
+
 	if targetStart == -1 {
-		// Fallback: Target provided in the path
+		// If not in query, check if target is provided in the path
 		if strings.HasPrefix(r.URL.Path, "/proxy/") {
 			return r.URL.Path[len("/proxy/"):]
 		}
 		return ""
 	}
-	// Find the end of the target value (next '&' if it exists)
+
+	// Extract target value from raw query string
 	targetValueEncoded := rawQuery[targetStart+len(targetPrefix):]
 	endIndex := strings.Index(targetValueEncoded, "&")
 	if endIndex != -1 {
 		targetValueEncoded = targetValueEncoded[:endIndex]
 	}
+
 	if *verbose {
 		log.Printf("Target URL from raw query (encoded): %s", targetValueEncoded)
 	}
+
 	return targetValueEncoded
 }
 
-// Process the proxy request with the given target URL (manual parsing, no stdlib URL parsing)
+// processProxyRequest handles the proxy forwarding logic
 func processProxyRequest(w http.ResponseWriter, r *http.Request, rawTargetURL string) {
 	if *verbose {
 		log.Printf("Processing raw target URL: %s", rawTargetURL)
@@ -157,49 +125,14 @@ func processProxyRequest(w http.ResponseWriter, r *http.Request, rawTargetURL st
 		log.Printf("Decoded target URL: %s", decodedURL)
 	}
 
-	// Manually append any additional query parameters from the original request (excluding 'target')
-	rawQuery := r.URL.RawQuery
-	additionalParams := ""
-	for _, part := range strings.Split(rawQuery, "&") {
-		if !strings.HasPrefix(part, "target=") && part != "" {
-			if additionalParams == "" {
-				additionalParams = part
-			} else {
-				additionalParams += "&" + part
-			}
-		}
-	}
-	finalURL := decodedURL
-	if additionalParams != "" {
-		if strings.Contains(decodedURL, "?") {
-			finalURL += "&" + additionalParams
-		} else {
-			finalURL += "?" + additionalParams
-		}
-	}
+	// Process additional query parameters
+	finalURL := buildFinalURL(r, decodedURL)
 
-	if *verbose {
-		log.Printf("Final URL to proxy (manual): %s", finalURL)
-	}
-
-	// Create the proxy request directly, do not use url.Parse for the target
-	proxyReq, err := http.NewRequest(r.Method, finalURL, r.Body)
+	// Create proxy request
+	proxyReq, err := createProxyRequest(r, finalURL)
 	if err != nil {
 		http.Error(w, "Error creating proxy request", http.StatusInternalServerError)
 		return
-	}
-
-	// Copy original headers
-	copyRequestHeaders(r, proxyReq)
-
-	// Set the Host header from the target URL
-	if hostStart := strings.Index(finalURL, "://"); hostStart != -1 {
-		hostPort := finalURL[hostStart+3:]
-		slash := strings.Index(hostPort, "/")
-		if slash != -1 {
-			hostPort = hostPort[:slash]
-		}
-		proxyReq.Host = hostPort
 	}
 
 	// Send the request
@@ -215,7 +148,62 @@ func processProxyRequest(w http.ResponseWriter, r *http.Request, rawTargetURL st
 	processProxyResponse(w, r, resp)
 }
 
-// Copy request headers to proxy request
+// buildFinalURL constructs the final URL with additional parameters
+func buildFinalURL(r *http.Request, decodedURL string) string {
+	// Extract non-target query parameters
+	rawQuery := r.URL.RawQuery
+	additionalParams := ""
+	for _, part := range strings.Split(rawQuery, "&") {
+		if !strings.HasPrefix(part, "target=") && part != "" {
+			if additionalParams == "" {
+				additionalParams = part
+			} else {
+				additionalParams += "&" + part
+			}
+		}
+	}
+
+	// Combine target URL with additional parameters
+	finalURL := decodedURL
+	if additionalParams != "" {
+		if strings.Contains(decodedURL, "?") {
+			finalURL += "&" + additionalParams
+		} else {
+			finalURL += "?" + additionalParams
+		}
+	}
+
+	if *verbose {
+		log.Printf("Final URL to proxy: %s", finalURL)
+	}
+
+	return finalURL
+}
+
+// createProxyRequest creates a new HTTP request for the target URL
+func createProxyRequest(r *http.Request, finalURL string) (*http.Request, error) {
+	proxyReq, err := http.NewRequest(r.Method, finalURL, r.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy original headers
+	copyRequestHeaders(r, proxyReq)
+
+	// Set the Host header from the target URL
+	if hostStart := strings.Index(finalURL, "://"); hostStart != -1 {
+		hostPort := finalURL[hostStart+3:]
+		slash := strings.Index(hostPort, "/")
+		if slash != -1 {
+			hostPort = hostPort[:slash]
+		}
+		proxyReq.Host = hostPort
+	}
+
+	return proxyReq, nil
+}
+
+// copyRequestHeaders copies relevant headers from the original request
 func copyRequestHeaders(r *http.Request, proxyReq *http.Request) {
 	// Copy original headers, except those that should be skipped
 	for key, values := range r.Header {
@@ -232,7 +220,7 @@ func copyRequestHeaders(r *http.Request, proxyReq *http.Request) {
 	}
 }
 
-// Process the proxy response
+// processProxyResponse handles the response from the target server
 func processProxyResponse(w http.ResponseWriter, r *http.Request, resp *http.Response) {
 	// Add CORS headers
 	addCORSHeaders(w, r)
@@ -255,7 +243,11 @@ func processProxyResponse(w http.ResponseWriter, r *http.Request, resp *http.Res
 	}
 }
 
-// Handle preflight OPTIONS requests
+// -----------------------------
+// CORS HANDLING
+// -----------------------------
+
+// handlePreflight handles CORS preflight OPTIONS requests
 func handlePreflight(w http.ResponseWriter, r *http.Request) {
 	addCORSHeaders(w, r)
 
@@ -278,7 +270,7 @@ func handlePreflight(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent) // 204 No Content
 }
 
-// Add CORS headers to the response
+// addCORSHeaders adds CORS headers to the response
 func addCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 
@@ -295,7 +287,11 @@ func addCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Vary", "Origin")
 }
 
-// Get the real client IP from headers set by Nginx
+// -----------------------------
+// UTILITY FUNCTIONS
+// -----------------------------
+
+// getClientIP extracts the original client IP address
 func getClientIP(r *http.Request) string {
 	// X-Forwarded-For can be comma-separated list of IPs
 	// The leftmost IP is the original client IP
@@ -317,7 +313,7 @@ func getClientIP(r *http.Request) string {
 	return strings.Split(r.RemoteAddr, ":")[0]
 }
 
-// Check if we should skip forwarding this header
+// shouldSkipHeader returns true if a header should not be forwarded
 func shouldSkipHeader(key string) bool {
 	lower := strings.ToLower(key)
 	return strings.EqualFold(key, "Connection") ||
@@ -329,7 +325,11 @@ func shouldSkipHeader(key string) bool {
 		strings.HasPrefix(lower, "x-nginx")
 }
 
-// Handle serving configuration files from embedded filesystem
+// -----------------------------
+// CONFIG FILE HANDLING
+// -----------------------------
+
+// handleConfigFiles serves embedded configuration files
 func handleConfigFiles(w http.ResponseWriter, r *http.Request) {
 	// Extract the filename from the path
 	filename := strings.TrimPrefix(r.URL.Path, "/getconfig/")
@@ -372,7 +372,7 @@ func handleConfigFiles(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Get content type based on file extension
+// getContentType determines content type based on file extension
 func getContentType(filename string) string {
 	switch path.Ext(filename) {
 	case ".json":
@@ -388,10 +388,9 @@ func getContentType(filename string) string {
 	}
 }
 
-// List available configuration files
+// listConfigFiles shows a list of available config files
 func listConfigFiles(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
-
 	fmt.Fprintf(w, "Available configuration files:\n\n")
 
 	fs.WalkDir(SampleConfigs, "getconfig", func(path string, d fs.DirEntry, err error) error {
@@ -406,4 +405,57 @@ func listConfigFiles(w http.ResponseWriter, r *http.Request) {
 	})
 
 	fmt.Fprintf(w, "\nUsage: GET /getconfig/{filename}\n")
+}
+
+// -----------------------------
+// USAGE/HELP FUNCTIONS
+// -----------------------------
+
+// handleRoot provides basic usage information
+func handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	displayUsage(w, r, "all")
+}
+
+// displayUsage outputs API usage instructions
+func displayUsage(w http.ResponseWriter, r *http.Request, section string) {
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+
+	if *verbose {
+		log.Printf("Original request: %s", r.URL.RawQuery)
+	}
+
+	fmt.Fprintf(w, "CORS Proxy Usage:\n")
+
+	// Show general usage info
+	fmt.Fprintf(w, "GET /proxy/{url} - Proxy to the specified URL\n")
+	fmt.Fprintf(w, "GET /getconfig/{filename} - Get embedded configuration file\n")
+
+	// Show section-specific examples
+	if section == "proxy" || section == "all" {
+		fmt.Fprintf(w, "\nProxy Examples:\n")
+		fmt.Fprintf(w, "  - GET /proxy/https://api.example.com/data\n")
+		fmt.Fprintf(w, "  - GET /proxy/?target=https://api.example.com/data\n")
+	}
+
+	if section == "config" || section == "all" {
+		fmt.Fprintf(w, "\nConfig Examples:\n")
+		fmt.Fprintf(w, "  - GET /getconfig/nginx\n")
+	}
+}
+
+// printStartupInfo logs information about the server configuration
+func printStartupInfo(listenAddr string) {
+	log.Printf("Starting CORS proxy server on %s", listenAddr)
+	log.Printf("CORS proxy supports:")
+	log.Printf("  - http://%s/proxy/{target-url}", listenAddr)
+	log.Printf("  - http://%s/proxy/?target={target-url}", listenAddr)
+	log.Printf("  - http://%s/getconfig/{filename}", listenAddr)
+	log.Printf("CORS Allow-Origin: %s", *allowedOrigin)
+	log.Printf("Trust X-Forwarded-* headers: %v", *trustProxy)
 }
