@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	port          = flag.Int("port", 8080, "Port to listen on")
+	port          = flag.Int("port", 8080, "Port to listen on ")
 	address       = flag.String("address", "127.0.0.1", "Address to listen on")
 	allowedOrigin = flag.String("allow-origin", "*", "CORS Allow-Origin header value")
 	verbose       = flag.Bool("verbose", false, "Enable verbose logging")
