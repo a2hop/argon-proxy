@@ -59,3 +59,4 @@ location /cors-proxy {
     proxy_send_timeout 60s;
     proxy_read_timeout 60s;
 }
+

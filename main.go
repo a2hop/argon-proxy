@@ -61,6 +61,8 @@ func displayUsage(w http.ResponseWriter, r *http.Request, section string) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 
+	log.Printf("Original request: %s", r.URL.RawQuery)
+
 	fmt.Fprintf(w, "CORS Proxy Usage:\n")
 
 	// Show general usage info
@@ -109,32 +111,40 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	processProxyRequest(w, r, targetURL)
 }
 
-// Parse target URL from request
+// Parse target URL from request (manual parsing, no stdlib URL parsing)
 func parseTargetURL(r *http.Request) string {
-	// Check if target is provided as a query parameter
-	targetParam := r.URL.Query().Get("target")
-	if targetParam != "" {
-		if *verbose {
-			log.Printf("Target URL from query parameter: %s", targetParam)
+	rawQuery := r.URL.RawQuery
+	targetPrefix := "target="
+	targetStart := strings.Index(rawQuery, targetPrefix)
+	if targetStart == -1 {
+		// Fallback: Target provided in the path
+		if strings.HasPrefix(r.URL.Path, "/proxy/") {
+			return r.URL.Path[len("/proxy/"):]
 		}
-		return targetParam
+		return ""
 	}
-
-	// Target provided in the path
-	if strings.HasPrefix(r.URL.Path, "/proxy/") {
-		return r.URL.Path[len("/proxy/"):]
+	// Find the end of the target value (next '&' if it exists)
+	targetValueEncoded := rawQuery[targetStart+len(targetPrefix):]
+	endIndex := strings.Index(targetValueEncoded, "&")
+	if endIndex != -1 {
+		targetValueEncoded = targetValueEncoded[:endIndex]
 	}
-
-	// No target URL found
-	return ""
+	if *verbose {
+		log.Printf("Target URL from raw query (encoded): %s", targetValueEncoded)
+	}
+	return targetValueEncoded
 }
 
-// Process the proxy request with the given target URL
-func processProxyRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
-	// Decode the URL if it's URL-encoded
-	decodedURL, err := url.QueryUnescape(targetURL)
+// Process the proxy request with the given target URL (manual parsing, no stdlib URL parsing)
+func processProxyRequest(w http.ResponseWriter, r *http.Request, rawTargetURL string) {
+	if *verbose {
+		log.Printf("Processing raw target URL: %s", rawTargetURL)
+	}
+
+	// Decode the raw target URL string
+	decodedURL, err := url.QueryUnescape(rawTargetURL)
 	if err != nil {
-		http.Error(w, "Invalid URL encoding", http.StatusBadRequest)
+		http.Error(w, "Invalid URL encoding in target", http.StatusBadRequest)
 		return
 	}
 
@@ -144,47 +154,36 @@ func processProxyRequest(w http.ResponseWriter, r *http.Request, targetURL strin
 	}
 
 	if *verbose {
-		log.Printf("Proxying request to: %s", decodedURL)
-		if *trustProxy {
-			log.Printf("Original client IP: %s", getClientIP(r))
-		}
+		log.Printf("Decoded target URL: %s", decodedURL)
 	}
 
-	// Parse the target URL
-	parsedURL, err := url.Parse(decodedURL)
-	if err != nil {
-		http.Error(w, "Invalid URL", http.StatusBadRequest)
-		return
-	}
-
-	// Copy original query parameters excluding 'target'
-	copyQueryParams(r, parsedURL)
-
-	// Create and execute the proxy request
-	executeProxyRequest(w, r, parsedURL)
-}
-
-// Copy query parameters from original request to target URL
-func copyQueryParams(r *http.Request, targetURL *url.URL) {
-	if r.URL.RawQuery != "" {
-		values := r.URL.Query()
-		values.Del("target") // Remove the target parameter
-
-		if len(values) > 0 {
-			// If there are other query parameters, append them
-			if targetURL.RawQuery != "" {
-				targetURL.RawQuery += "&" + values.Encode()
+	// Manually append any additional query parameters from the original request (excluding 'target')
+	rawQuery := r.URL.RawQuery
+	additionalParams := ""
+	for _, part := range strings.Split(rawQuery, "&") {
+		if !strings.HasPrefix(part, "target=") && part != "" {
+			if additionalParams == "" {
+				additionalParams = part
 			} else {
-				targetURL.RawQuery = values.Encode()
+				additionalParams += "&" + part
 			}
 		}
 	}
-}
+	finalURL := decodedURL
+	if additionalParams != "" {
+		if strings.Contains(decodedURL, "?") {
+			finalURL += "&" + additionalParams
+		} else {
+			finalURL += "?" + additionalParams
+		}
+	}
 
-// Create and execute the proxy request
-func executeProxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
-	// Create a new request
-	proxyReq, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
+	if *verbose {
+		log.Printf("Final URL to proxy (manual): %s", finalURL)
+	}
+
+	// Create the proxy request directly, do not use url.Parse for the target
+	proxyReq, err := http.NewRequest(r.Method, finalURL, r.Body)
 	if err != nil {
 		http.Error(w, "Error creating proxy request", http.StatusInternalServerError)
 		return
@@ -193,8 +192,15 @@ func executeProxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.
 	// Copy original headers
 	copyRequestHeaders(r, proxyReq)
 
-	// Set the Host header
-	proxyReq.Host = targetURL.Host
+	// Set the Host header from the target URL
+	if hostStart := strings.Index(finalURL, "://"); hostStart != -1 {
+		hostPort := finalURL[hostStart+3:]
+		slash := strings.Index(hostPort, "/")
+		if slash != -1 {
+			hostPort = hostPort[:slash]
+		}
+		proxyReq.Host = hostPort
+	}
 
 	// Send the request
 	client := &http.Client{}
