@@ -1,0 +1,8 @@
+Package: a2h--argon-proxy
+Version: 0.0.2
+Section: base
+Priority: optional
+Architecture: amd64
+Depends: 
+Maintainer: Lucas Kafarski
+Description: Simple proxy to work around cors and http mixed content

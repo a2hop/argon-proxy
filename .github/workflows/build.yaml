@@ -22,12 +22,113 @@ jobs:
         with:
           go-version: '1.24'
 
+      - name: Get version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            # Extract version from tag (remove 'v' prefix if present)
+            VERSION=${GITHUB_REF#refs/tags/v}
+            VERSION=${VERSION#refs/tags/}  # Also handle tags without 'v' prefix
+          else
+            # For non-tagged builds, get latest release version
+            LATEST_RELEASE=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r '.tag_name // empty')
+            if [ -n "$LATEST_RELEASE" ]; then
+              # Remove 'v' prefix if present and use latest release version
+              VERSION=${LATEST_RELEASE#v}
+              echo "Using latest release version: $VERSION"
+            else
+              # Only use 0.0.2 if no releases exist at all
+              VERSION="0.0.2"
+              echo "No releases found, using default version: $VERSION"
+            fi
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "deb_filename=a2h--argon-proxy_${VERSION}_amd64.deb" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
       - name: Build binary
         run: go build -v -o argon-proxy .
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev fakeroot
+
+      - name: Validate package files
+        run: |
+          PKGDIR=pkg/deb2404
+          echo "Checking for required package files..."
+          ls -la $PKGDIR/
+          if [ ! -f "$PKGDIR/control" ]; then
+            echo "Error: control file not found"
+            exit 1
+          fi
+          if [ ! -f "$PKGDIR/postinst" ]; then
+            echo "Error: postinst file not found"
+            exit 1
+          fi
+          echo "Package files validation passed"
+
+      - name: Create Debian package structure
+        run: |
+          PKGDIR=pkg/deb2404
+          OUTDIR=debian-package
+          mkdir -p $OUTDIR/DEBIAN
+          mkdir -p $OUTDIR/usr/local/bin
+          mkdir -p $OUTDIR/usr/lib/systemd/system
+          mkdir -p $OUTDIR/usr/share/doc/a2h--argon-proxy
+          
+          # Copy the built binary
+          cp argon-proxy $OUTDIR/usr/local/bin/
+          chmod +x $OUTDIR/usr/local/bin/argon-proxy
+          
+          # Copy systemd service file
+          cp argon-proxy.service $OUTDIR/usr/lib/systemd/system/
+          
+          # Copy postinst script
+          cp $PKGDIR/postinst $OUTDIR/DEBIAN/
+          chmod +x $OUTDIR/DEBIAN/postinst
+          
+          # Copy control file and substitute version
+          sed "s/^Version: .*/Version: ${{ steps.version.outputs.version }}/" $PKGDIR/control > $OUTDIR/DEBIAN/control
+          
+          # Copy other maintainer scripts if present
+          for f in prerm postrm; do
+            if [ -f $PKGDIR/$f ]; then
+              echo "Copying $f script..."
+              cp $PKGDIR/$f $OUTDIR/DEBIAN/
+              chmod +x $OUTDIR/DEBIAN/$f
+            fi
+          done
+          
+          # Add a README if present
+          if [ -f README.md ]; then
+            cp README.md $OUTDIR/usr/share/doc/a2h--argon-proxy/
+          fi
+          
+          # Show the package structure
+          echo "Package structure:"
+          find $OUTDIR -type f -exec ls -la {} \;
+
+      - name: Build Debian package
+        run: |
+          fakeroot dpkg-deb --build debian-package ${{ steps.version.outputs.deb_filename }}
+          dpkg-deb --info ${{ steps.version.outputs.deb_filename }}
+          dpkg-deb --contents ${{ steps.version.outputs.deb_filename }}
+
+      - name: Run package tests
+        run: |
+          dpkg-deb --show ${{ steps.version.outputs.deb_filename }}
+          mkdir -p test-install
+          dpkg-deb --extract ${{ steps.version.outputs.deb_filename }} test-install/
+          ls -la test-install/
+          echo "Testing binary permissions:"
+          find test-install/usr/local/bin -type f -exec file {} \;
 
       - name: Get latest release
         id: latest_release
         uses: actions/github-script@v6
+        continue-on-error: true
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -37,15 +138,19 @@ jobs:
             });
             
             if (releases.length === 0) {
-              return core.setFailed('No releases found');
+              core.setOutput('has_release', 'false');
+              console.log('No releases found - skipping release upload');
+              return;
             }
             
             const latestRelease = releases[0];
+            core.setOutput('has_release', 'true');
             core.setOutput('release_id', latestRelease.id);
             core.setOutput('release_tag', latestRelease.tag_name);
 
-      - name: Check if binary asset exists
-        id: check_asset
+      - name: Check if assets exist
+        id: check_assets
+        if: steps.latest_release.outputs.has_release == 'true'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -58,45 +163,95 @@ jobs:
               release_id: releaseId
             });
             
-            const existingAsset = assets.find(asset => asset.name === 'argon-proxy');
+            const assetNames = [
+              '${{ steps.version.outputs.deb_filename }}'
+            ];
             
-            if (existingAsset) {
-              core.setOutput('asset_id', existingAsset.id);
-              core.setOutput('asset_exists', 'true');
-            } else {
-              core.setOutput('asset_exists', 'false');
+            const existingAssets = {};
+            for (const asset of assets) {
+              if (assetNames.includes(asset.name)) {
+                existingAssets[asset.name] = asset.id;
+              }
             }
+            
+            core.setOutput('existing_assets', JSON.stringify(existingAssets));
 
-      - name: Delete existing binary asset if exists
-        if: steps.check_asset.outputs.asset_exists == 'true'
+      - name: Delete existing assets if they exist
+        if: steps.latest_release.outputs.has_release == 'true'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const assetId = ${{ steps.check_asset.outputs.asset_id }};
+            const existingAssets = JSON.parse('${{ steps.check_assets.outputs.existing_assets }}');
             
-            await github.rest.repos.deleteReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              asset_id: assetId
-            });
+            for (const [assetName, assetId] of Object.entries(existingAssets)) {
+              console.log(`Deleting existing asset: ${assetName}`);
+              await github.rest.repos.deleteReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                asset_id: parseInt(assetId)
+              });
+            }
 
-      - name: Upload binary to release
+      - name: Upload assets to release
+        if: steps.latest_release.outputs.has_release == 'true'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const releaseId = ${{ steps.latest_release.outputs.release_id }};
+            const releaseId = '${{ steps.latest_release.outputs.release_id }}';
             
-            // Read binary file
-            const binaryData = fs.readFileSync('./argon-proxy');
+            const assets = [
+              { path: './${{ steps.version.outputs.deb_filename }}', name: '${{ steps.version.outputs.deb_filename }}', contentType: 'application/vnd.debian.binary-package' }
+            ];
             
-            // Upload binary to release
-            await github.rest.repos.uploadReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: releaseId,
-              name: 'argon-proxy',
-              data: binaryData
-            });
+            for (const asset of assets) {
+              console.log(`Uploading ${asset.name}...`);
+              const data = fs.readFileSync(asset.path);
+              await github.rest.repos.uploadReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: parseInt(releaseId),
+                name: asset.name,
+                data: data
+              });
+            }
+
+      - name: Upload artifacts (no release)
+        if: steps.latest_release.outputs.has_release == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: argon-proxy-build-${{ steps.version.outputs.version }}
+          path: |
+            ${{ steps.version.outputs.deb_filename }}
+          retention-days: 90
+
+      - name: Create release summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Debian Package**: ${{ steps.version.outputs.deb_filename }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Architecture**: amd64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Package Contents" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          dpkg-deb --contents ${{ steps.version.outputs.deb_filename }} >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Service Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Binary**: /usr/local/bin/argon-proxy" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service**: argon-proxy.service" >> $GITHUB_STEP_SUMMARY
+          echo "- **Default Address**: 127.0.0.1:8080" >> $GITHUB_STEP_SUMMARY
+          echo "- **CORS**: Enabled for all origins" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Installation" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# Download and install the .deb package" >> $GITHUB_STEP_SUMMARY
+          echo "wget https://github.com/${{ github.repository }}/releases/download/\$TAG/${{ steps.version.outputs.deb_filename }}" >> $GITHUB_STEP_SUMMARY
+          echo "sudo dpkg -i ${{ steps.version.outputs.deb_filename }}" >> $GITHUB_STEP_SUMMARY
+          echo "sudo apt-get install -f  # Fix any dependency issues" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Service will be automatically started" >> $GITHUB_STEP_SUMMARY
+          echo "sudo systemctl status argon-proxy" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

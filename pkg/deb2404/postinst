@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+
+echo "Running post-installation script for a2h--argon-proxy"
+
+# Reload systemd manager configuration to apply changes
+systemctl daemon-reload
+systemctl enable argon-proxy
+systemctl start argon-proxy
+

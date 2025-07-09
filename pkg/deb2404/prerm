@@ -1,0 +1,13 @@
+#!/bin/bash
+set -e
+
+echo "Running pre-removal script for a2h--argon-proxy"
+
+# Stop and disable the service before package removal
+if [ -x "$(command -v systemctl)" ]; then
+    systemctl stop argon-proxy || true
+    systemctl disable argon-proxy || true
+fi
+
+# Give processes time to terminate
+sleep 1
